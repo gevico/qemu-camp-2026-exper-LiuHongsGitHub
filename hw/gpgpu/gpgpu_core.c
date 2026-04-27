@@ -472,11 +472,11 @@ uint32_t read_ctrl_reg(GPGPUState *s, uint32_t addr) {
             return s->simt.block_id[2]; /* blockIdx.z */
         
         case 0x20:
-            return s->kernel.block_dim[0]; /* warp_id */
+            return s->kernel.block_dim[0]; /* block_dim.X */
         case 0x24:
-            return s->kernel.block_dim[1]; /* lane_id */   
+            return s->kernel.block_dim[1]; /* block_dim */   
         case 0x28:
-            return s->kernel.block_dim[2]; /* blockDim.x */
+            return s->kernel.block_dim[2]; /* block_dim.x */
 
         case 0x30:
             return s->kernel.grid_dim[0]; /* gridDim.x */

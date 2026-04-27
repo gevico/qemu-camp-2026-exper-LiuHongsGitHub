@@ -25,12 +25,108 @@
 /* TODO: Implement MMIO control register read */
 static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned size)
 {
-    
-    
+    GPGPUState *s = GPGPU(opaque);
+    uint32_t val = 0;
+    switch (addr)
+    {
+    case GPGPU_REG_DEV_ID:
+        return GPGPU_DEV_ID_VALUE;
+    case GPGPU_REG_DEV_VERSION:
+        return GPGPU_DEV_VERSION_VALUE;
+    case GPGPU_REG_DEV_CAPS:
+        return 0;
+    case GPGPU_REG_VRAM_SIZE_LO:
+        return (uint32_t)(s->vram_size & 0xFFFFFFFF);
+    case GPGPU_REG_VRAM_SIZE_HI:
+        return (uint32_t)(s->vram_size >> 32);
 
+    //global control/status registers
+    case GPGPU_REG_GLOBAL_CTRL:
+        return s->global_ctrl;
+    case GPGPU_REG_GLOBAL_STATUS:
+        return s->global_status;
+    case GPGPU_REG_ERROR_STATUS:
+        return s->error_status;
 
+    //interrupt registers
+    case GPGPU_REG_IRQ_ENABLE:
+        return s->irq_enable;
+    case GPGPU_REG_IRQ_STATUS:
+        return s->irq_status;
+    case GPGPU_REG_IRQ_ACK:
+        return 0;
+    /* ======== 内核分发 ======== */
+    case GPGPU_REG_KERNEL_ADDR_LO:
+        return (uint32_t)(s->kernel.kernel_addr & 0xFFFFFFFF);
+    case GPGPU_REG_KERNEL_ADDR_HI:
+        return (uint32_t)(s->kernel.kernel_addr >> 32);
+    case GPGPU_REG_KERNEL_ARGS_LO:
+        return (uint32_t)(s->kernel.kernel_args & 0xFFFFFFFF);
+    case GPGPU_REG_KERNEL_ARGS_HI:
+        return (uint32_t)(s->kernel.kernel_args >> 32);
+    case GPGPU_REG_GRID_DIM_X:
+        return s->kernel.grid_dim[0];
+    case GPGPU_REG_GRID_DIM_Y:
+        return s->kernel.grid_dim[1];
+    case GPGPU_REG_GRID_DIM_Z:
+        return s->kernel.grid_dim[2];
+    case GPGPU_REG_BLOCK_DIM_X:
+        return s->kernel.block_dim[0];
+    case GPGPU_REG_BLOCK_DIM_Y:
+        return s->kernel.block_dim[1];
+    case GPGPU_REG_BLOCK_DIM_Z:
+        return s->kernel.block_dim[2];
+    case GPGPU_REG_SHARED_MEM_SIZE:
+        return s->kernel.shared_mem_size;
+    case GPGPU_REG_DISPATCH:
+        return 0;  /* Write-only */
 
-    return 0;
+    /* ======== DMA ======== */
+    case GPGPU_REG_DMA_SRC_LO:
+        return (uint32_t)(s->dma.src_addr & 0xFFFFFFFF);
+    case GPGPU_REG_DMA_SRC_HI:
+        return (uint32_t)(s->dma.src_addr >> 32);
+    case GPGPU_REG_DMA_DST_LO:
+        return (uint32_t)(s->dma.dst_addr & 0xFFFFFFFF);
+    case GPGPU_REG_DMA_DST_HI:
+        return (uint32_t)(s->dma.dst_addr >> 32);
+    case GPGPU_REG_DMA_SIZE:
+        return s->dma.size;
+    case GPGPU_REG_DMA_CTRL:
+        return s->dma.ctrl;
+    case GPGPU_REG_DMA_STATUS:
+        return s->dma.status;
+
+    /* ======== SIMT 线程上下文 (CTRL 设备) ======== */
+    case GPGPU_REG_THREAD_ID_X:
+        return s->simt.thread_id[0];
+    case GPGPU_REG_THREAD_ID_Y:
+        return s->simt.thread_id[1];
+    case GPGPU_REG_THREAD_ID_Z:
+        return s->simt.thread_id[2];
+    case GPGPU_REG_BLOCK_ID_X:
+        return s->simt.block_id[0];
+    case GPGPU_REG_BLOCK_ID_Y:
+        return s->simt.block_id[1];
+    case GPGPU_REG_BLOCK_ID_Z:
+        return s->simt.block_id[2];
+    case GPGPU_REG_WARP_ID:
+        return s->simt.warp_id;
+    case GPGPU_REG_LANE_ID:
+        return s->simt.lane_id;
+
+    /* ======== 同步 ======== */
+    case GPGPU_REG_BARRIER:
+        return 0;  /* Write-only */
+    case GPGPU_REG_THREAD_MASK:
+        return s->simt.thread_mask;
+
+    default:
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "GPGPU: read to unimplemented register 0x%x\n",
+                      addr);
+        return 0;
+    }
 }
 
 /* TODO: Implement MMIO control register write */
