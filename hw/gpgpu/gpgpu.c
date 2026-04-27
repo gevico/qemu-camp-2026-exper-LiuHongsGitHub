@@ -25,9 +25,11 @@
 /* TODO: Implement MMIO control register read */
 static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned size)
 {
-    (void)opaque;
-    (void)addr;
-    (void)size;
+    
+    
+
+
+
     return 0;
 }
 
