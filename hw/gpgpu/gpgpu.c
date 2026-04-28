@@ -134,48 +134,8 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
                              unsigned size)
 {
     GPGPUState *s = GPGPU(opaque);
-    s->global_status = GPGPU_STATUS_BUSY;  /* 模拟设备忙碌状态 */
-    switch (addr)
-    {    
-    case GPGPU_REG_GLOBAL_CTRL:
-        s->global_ctrl = (uint32_t)val;
-        break;
-    case GPGPU_REG_IRQ_ENABLE:
-        s->irq_enable = (uint32_t)val;
-        break;
-    case GPGPU_REG_IRQ_ACK:
-        s->irq_status &= ~((uint32_t)val);  /* 清除对应的中断状态 */
-        break;
-    case GPGPU_REG_DISPATCH:
-        gpgpu_dispatch(s);
-        break;
-    case GPGPU_REG_BARRIER:
-        gpgpu_barrier(s);
-        break;
-    case GPGPU_REG_DMA_CTRL:
-        s->dma.ctrl = (uint32_t)val;
-        break;
-    case GPGPU_REG_DMA_SRC_LO:
-        s->dma.src_addr = (s->dma.src_addr & 0xFFFFFFFF00000000) | (val & 0xFFFFFFFF);
-        break;
-    case GPGPU_REG_DMA_SRC_HI:
-        s->dma.src_addr = (s->dma.src_addr & 0x00000000FFFFFFFF) | (val << 32);
-        break;
-    case GPGPU_REG_DMA_DST_LO:
-        s->dma.dst_addr = (s->dma.dst_addr & 0xFFFFFFFF00000000) | (val & 0xFFFFFFFF);
-        break;
-    case GPGPU_REG_DMA_DST_HI:
-        s->dma.dst_addr = (s->dma.dst_addr & 0x00000000FFFFFFFF) | (val << 32);
-        break;
-    case GPGPU_REG_DMA_SIZE:
-        s->dma.size = (uint32_t)val;
-        break;
-    default:
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "GPGPU: write to unimplemented register 0x%x\n",
-                      addr);
-        break;
-    }
+    uint32_t offset = addr;
+    
 }
 
 static const MemoryRegionOps gpgpu_ctrl_ops = {
@@ -191,22 +151,20 @@ static const MemoryRegionOps gpgpu_ctrl_ops = {
 /* TODO: Implement VRAM read */
 static uint64_t gpgpu_vram_read(void *opaque, hwaddr addr, unsigned size)
 {
-    GPGPUState *s = GPGPU(opaque);
-    uint64_t val = 0;
-    if (addr + size <= s->vram_size) {
-        memcpy(&val,s->vram_ptr+addr,size);
-    }
-    return val;
+    (void)opaque;
+    (void)addr;
+    (void)size;
+    return 0;
 }
 
 /* TODO: Implement VRAM write */
 static void gpgpu_vram_write(void *opaque, hwaddr addr, uint64_t val,
                              unsigned size)
 {
-    GPGPUState *s = GPGPU(opaque);
-    if (addr + size <= s->vram_size) {
-        memcpy(s->vram_ptr+addr,&val,size);
-    }
+    (void)opaque;
+    (void)addr;
+    (void)val;
+    (void)size;
 }
 
 static const MemoryRegionOps gpgpu_vram_ops = {

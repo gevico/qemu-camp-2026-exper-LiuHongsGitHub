@@ -398,11 +398,15 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                                     // 0
                                     f32_val = sign ? 0x80000000 : 0x00000000;
                                 } else if (exp4 == 0) {
-                                    // 非规格化数
-                                    int shift = __builtin_clz(mantissa3) - 29; // 计算需要左移的位数
-                                    uint32_t mantissa = (mantissa3 << shift) & 0x7FFFFF; // 将 M 部分左移到 FP32 的位置
-                                    int32_t exp = 1 - shift; // E4M3 的指数偏移是 7，调整后为 1 - shift
-                                    f32_val = (sign << 31) | ((exp + 127) << 23) | mantissa; // 构造 FP32 值
+                                    //subnormal: value = 0.mantissa3 * 2^(-6)
+                                    //find the position of the highest 1 in mantissa3
+                                    int msb = 2;
+                                    while (msb >= 0 && !((mantissa3 >> msb) & 1)) {
+                                        msb--;
+                                    }
+                                    int32_t true_exp = -6 - (2 - msb); // 需要右移的位数
+                                    uint32_t norm_m = (mantissa3 << (21 - msb)) & 0x7FFFFF; // 将有效位左移到 FP32 的位置
+                                    f32_val = ((uint32_t)sign << 31) | ((uint32_t)(true_exp + 127) << 23) | norm_m; // 加上 FP32 的指数偏
                                 } else if (exp4 == 0xF) {
                                     // E4M3 不应有 Inf/NaN，按最大值处理
                                     // saturate to max: sign ? -448 : +448
@@ -411,14 +415,94 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                                     // 正常数
                                     int32_t exp = exp4 - 7 + 127; // E4M3 的指数偏移是 7，FP32 的指数偏移是 127
                                     uint32_t mantissa = (mantissa3 << 20) & 0x7FFFFF; // 将 M 部分左移到 FP32 的位置
-                                    f32_val = ((uint32_t)sign << 31) | (exp32 << 23) | mantissa32 | 0x40000000;  // 加隐含的 1
+                                    f32_val = ((uint32_t)sign << 31) | (exp << 23) | mantissa | 0x40000000;  // 加隐含的 1
                                 }
+                                if (rd != 0) lane->fpr[rd] = f32_val;
                             }
                             break;
                             case 1:{//fcvt.e4m3.s fd,fs1 - FP32 → E4M3 (下行写)
-                                uint32_t f32_val = lane->fpr[rs1];
-                                uint8_t e4m3_val = (f32_val >> 24) & 0xFF;
-                                lane->fpr[rd] = e4m3_val;
+                                uint32_t bits = lane->fpr[rs1];
+                                bool sign = (bits >> 31) & 1;
+                                uint32_t e8 = (bits >> 23) & 0xFF;
+                                uint32_t m23 = bits & 0x7FFFFF;
+
+                                uint8_t e4m3_val;
+                                
+                                if (e8 == 0 && m23 == 0) {
+                                    /* ±Zero */
+                                    e4m3_val = sign ? 0x80 : 0x00;
+                                } else if (e8 == 255) {
+                                    /* NaN / Inf → 饱和 */
+                                    e4m3_val = sign ? 0xFE : 0x7E;  // ±448 saturate
+                                }  else {
+                                    int32_t true_exp;
+                                    uint32_t eff_mant; 
+                                    if (e8 == 0) {
+                                        /* FP32 subnormal → normalize */
+                                        int shift = __builtin_clz(m23) - 8;
+                                        eff_mant = m23 << (shift + 1);
+                                        true_exp = -126 - shift;
+                                    } else {
+                                        /* Normal */
+                                        eff_mant = (1U << 23) | m23;
+                                        true_exp = (int32_t)e8 - 127;
+                                    }
+                                    int32_t e4m3_exp = true_exp + 7; 
+                                    if (e4m3_exp <= 0) {
+                                        if (e4m3_exp <= -4) {
+                                            e4m3_val = sign ? 0x80 : 0x00;
+                                        } else {
+                                           int shift_right = 1 - e4m3_exp;  // 正值: 需要右移的位数
+                                            /* 右移后的值: (eff_mant >> shift_right) 中,
+                                            * bit[22:20] 对应非规格化的 3 位尾数 */
+                                            if (shift_right >= 24) {
+                                                e4m3_val = sign ? 0x80 : 0x00;
+                                            } else {
+                                                uint32_t sub_mant = (eff_mant >> (shift_right - 1)) & 0x7;
+                                                /* 简单截断 (RTZ); 如需舍入可在此处加 guard/round/sticky */
+                                                e4m3_val = (sign << 7) | sub_mant;
+                                                /* 如果 sub_mant == 0 且舍入后为零，保持符号位区分 ±0 */
+                                            } 
+                                        }
+                                        e4m3_val = sign ? 0x80 : 0x00;  // 简化：舍入到零
+                                    } else if (e4m3_exp >= 15) {
+                                        /* 饱和 */
+                                        e4m3_val = (sign << 7) | 0x7E;  // exp=F, mant=111
+                                    } else {
+                                        /* 在范围内：截断尾数 24位 → 3位 */
+                                        uint32_t m3 = (eff_mant >> 20) & 0x7;
+                                        
+                                        uint32_t guard  = (eff_mant >> 19) & 1;
+                                        uint32_t round  = (eff_mant >> 18) & 1;
+                                        uint32_t sticky = ((eff_mant & 0x3FFFF) != 0) ? 1 : 0;
+
+                                        if (guard && (round || sticky)) {
+                                            /* 大于中间值 → 向上舍入 */
+                                            m3++;
+                                        } else if (guard && !round && !sticky) {
+                                            /* 恰好中间值 → 向偶数舍入 (RNE) */
+                                            if (m3 & 1) {  // 当前尾数是奇数
+                                                m3++;
+                                            }
+                                        }
+                                        /* RTZ (guard=0): 不做任何操作 */
+
+                                        /* 处理尾数进位: 7+1 = 8 → 尾数溢出 */
+                                        if (m3 >= 8) {
+                                            m3 = 0;
+                                            e4m3_exp++;
+                                            if (e4m3_exp >= 15) {
+                                                /* 进位导致超出范围 → 饱和 */
+                                                e4m3_val = (sign << 7) | 0x7E;
+                                            } else {
+                                                e4m3_val = (sign << 7) | ((uint32_t)e4m3_exp << 3) | m3;
+                                            }
+                                        } else {
+                                            e4m3_val = (sign << 7) | ((uint32_t)e4m3_exp << 3) | m3;
+                                        }
+                                    }
+                                }
+                                if (rd != 0) lane->fpr[rd] = e4m3_val;
                                 
                             }
                             break;
