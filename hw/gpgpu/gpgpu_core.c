@@ -506,15 +506,61 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                                 
                             }
                             break;
-                            case 2:{//up transfer,e5m2 -> FP32 read
-                                uint8_t e5m2_val = lane->fpr[rs1] & 0xFF;
-                                e5m2_val = (e5m2_val & 0x7F) << 1; // 去掉符号位，调整指数位置
-                                e5m2_val += 15; // E5M2 的指数偏移是 15
-                                
-                                uint32_t f32_val = ((uint32_t)e5m2_val) << 24;
-                                lane->fpr[rd] = f32_val;
+                            case 2: { /* fcvt.s.e5m2 fd, fs1 — E5M2 → FP32 (上行读) */
+                                uint8_t e5m2_bits = lane->fpr[rs1] & 0xFF;
+
+                                /* 提取 E5M2 位域: S(1) + E(5) + M(2) */
+                                bool     sign  = (e5m2_bits >> 7) & 1;
+                                uint8_t  e5    = (e5m2_bits >> 2) & 0x1F;  // 5-bit exponent
+                                uint8_t  m2    = e5m2_bits & 0x3;           // 2-bit mantissa
+
+                                uint32_t f32_val;
+
+                                if (e5 == 0) {
+                                    if (m2 == 0) {
+                                        /* ±Zero */
+                                        f32_val = sign ? 0x80000000U : 0x00000000U;
+                                    } else {
+                                        /* Subnormal: value = 0.MM * 2^(-14)
+                                        * 只有 3 种可能值: M2=01,10,11
+                                        *
+                                        * 归一化: 找到 msb, 左移, 计算真实指数
+                                        */
+                                        int msb = 1;  // M2 是 2 位, msb 在 bit[1] 或 bit[0]
+                                        while (msb >= 0 && !((m2 >> msb) & 1)) {
+                                            msb--;
+                                        }
+                                        int32_t true_exp = -14 - (1 - msb);
+                                        uint32_t norm_mant = (m2 << (22 - msb)) & 0x7FFFFF;
+
+                                        f32_val = ((uint32_t)sign << 31)
+                                                | ((uint32_t)(true_exp + 127) << 23)
+                                                | norm_mant;
+                                    }
+                                } else if (e5 == 31) {  // 0b11111
+                                    if (m2 == 0) {
+                                        /* ±Infinity */
+                                        f32_val = sign ? 0xFF800000U : 0x7F800000U;
+                                    } else {
+                                        /* NaN (Quiet NaN) */
+                                        f32_val = 0x7FC00000U;  // 标准 Quiet NaN
+                                        if (sign) f32_val |= 0x80000000U;  // 可选: 保持符号
+                                    }
+                                } else {
+                                    /* Normal: value = (1 + M2/4) * 2^(e5 - 15) */
+                                    int32_t true_exp = (int32_t)e5 - 15;
+                                    uint32_t f32_exp   = (uint32_t)(true_exp + 127);
+                                    uint32_t f32_mant  = (uint32_t)m2 << 21;  // 2位尾数 → FP32 高2位
+
+                                    f32_val = ((uint32_t)sign << 31)
+                                            | (f32_exp << 23)
+                                            | f32_mant;
+                                }
+
+                                if (rd != 0) lane->fpr[rd] = f32_val;
                             }
                             break;
+
                             case 3:{//down transfer,FP32 -> E5M2 write
                                 uint32_t f32_val = lane->fpr[rs1];
                                 //
