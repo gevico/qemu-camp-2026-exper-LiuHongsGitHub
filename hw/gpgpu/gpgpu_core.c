@@ -245,11 +245,28 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
 
         /* ECALL/EBREAK */
         case 0x73:
-            /* Exit condition: x17 == 1 means "exit(0)" */
-            if (rd == 0 && rs1 == 0 && funct3 == 0) {
-                /* EBREAK: mark thread for exit */
-                lane->gpr[17] = 1;
+            uint32_t csr_imm = (inst >> 20) & 0x1F;
+            if (funct3 == 0 && rd ==0 && rs1 == 0){
+                lane->gpr[17] =1;
+            } else if (funct3 == 2 || funct3 == 3 ||funct3 == 6 ||funct3 == 7) {
+                uint32_t csr_val = 0;
+                switch (csr_imm) {
+                    case CSR_MHARTID:
+                        csr_val = lane->mhartid;
+                        break;
+                    case CSR_FFLAGS:
+                        csr_val = lane->fcsr & 0x1F;
+                        break;
+                    case CSR_FRM:
+                        csr_val = (lane->fcsr >> 5) & 0x7;
+                        break;
+                    case CSR_FCSR:
+                        csr_val = lane->fcsr;
+                        break;
+                }
+                if (rd != 0) lane->gpr[rd] = csr_val;
             }
+            /* Exit condition: x17 == 1 means "exit(0)" */
             return;
         case 0x07:
             {
@@ -347,6 +364,94 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                             result = make_float32(float32_val(fs1) ^ (float32_val(fs2)&0x80000000));
                         }
                         if (rd != 0) lane->fpr[rd] = (uint32_t)result;
+                        break;
+                    case 0x22:
+                        switch (rs2) {
+                            case 0:
+                                uint16_t bf16_val = lane->fpr[rs1] & 0xFFFF;
+                                uint32_t f32_val = ((uint32_t)bf16_val) << 16;
+                                lane->fpr[rd] = f32_val;
+                                break;
+                            case 1:
+                                uint32_t f32_val = lane->fpr[rs1];
+                                uint16_t bf16_val = (f32_val >> 16) & 0xFFFF;
+                                lane->fpr[rd] = bf16_val;
+                                break;
+                            default:
+                                break;
+                        }
+                        update_fcsr(lane);
+                        break;
+                    case 0x24: /* FP8 E4M3/E5M2 */
+                        switch (rs2) {
+                            case 0:{/* fcvt.s.e4m3  fd, fs1  — E4M3 → FP32 (上行读) */
+                                // 从 fs1 取出 E4M3 格式的 8-bit 值
+                                // 转换为 FP32 格式
+                                // 写入 lane->fpr[rd]
+                                uint8_t e4m3_bits  = lane->fpr[rs1] & 0xFF;
+                                 // 解码 E4M3: S(1) + E(4) + M(3)
+                                bool sign = (e4m3_bits >> 7) & 1;
+                                uint8_t exp4 = (e4m3_bits >> 3) & 0xF;
+                                uint8_t mantissa3 = e4m3_bits & 0x7;
+                                uint32_t f32_val;
+                                if (exp4 == 0 && mantissa3 == 0) {
+                                    // 0
+                                    f32_val = sign ? 0x80000000 : 0x00000000;
+                                } else if (exp4 == 0) {
+                                    // 非规格化数
+                                    int shift = __builtin_clz(mantissa3) - 29; // 计算需要左移的位数
+                                    uint32_t mantissa = (mantissa3 << shift) & 0x7FFFFF; // 将 M 部分左移到 FP32 的位置
+                                    int32_t exp = 1 - shift; // E4M3 的指数偏移是 7，调整后为 1 - shift
+                                    f32_val = (sign << 31) | ((exp + 127) << 23) | mantissa; // 构造 FP32 值
+                                } else if (exp4 == 0xF) {
+                                    // E4M3 不应有 Inf/NaN，按最大值处理
+                                    // saturate to max: sign ? -448 : +448
+                                    f32_val = sign ? 0xC3E00000 : 0x43E00000;
+                                } else {
+                                    // 正常数
+                                    int32_t exp = exp4 - 7 + 127; // E4M3 的指数偏移是 7，FP32 的指数偏移是 127
+                                    uint32_t mantissa = (mantissa3 << 20) & 0x7FFFFF; // 将 M 部分左移到 FP32 的位置
+                                    f32_val = ((uint32_t)sign << 31) | (exp32 << 23) | mantissa32 | 0x40000000;  // 加隐含的 1
+                                }
+                            }
+                            break;
+                            case 1:{//fcvt.e4m3.s fd,fs1 - FP32 → E4M3 (下行写)
+                                uint32_t f32_val = lane->fpr[rs1];
+                                uint8_t e4m3_val = (f32_val >> 24) & 0xFF;
+                                lane->fpr[rd] = e4m3_val;
+                                
+                            }
+                            break;
+                            case 2:{//up transfer,e5m2 -> FP32 read
+                                uint8_t e5m2_val = lane->fpr[rs1] & 0xFF;
+                                e5m2_val = (e5m2_val & 0x7F) << 1; // 去掉符号位，调整指数位置
+                                e5m2_val += 15; // E5M2 的指数偏移是 15
+                                
+                                uint32_t f32_val = ((uint32_t)e5m2_val) << 24;
+                                lane->fpr[rd] = f32_val;
+                            }
+                            break;
+                            case 3:{//down transfer,FP32 -> E5M2 write
+                                uint32_t f32_val = lane->fpr[rs1];
+                                //
+
+                                
+                            }
+                            break;                            
+                        }
+                        update_fcsr(lane);
+                        break;
+                    case 0x26:
+                        switch (rs2) {
+                            case 0:{
+
+                            }
+                            break;
+                            case 1:{
+
+                            }
+                            break;
+                        }
                         break;
                     case 0x28: 
                         if (funct3 == 0) {
