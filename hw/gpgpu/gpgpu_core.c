@@ -526,16 +526,19 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                                         *
                                         * 归一化: 找到 msb, 左移, 计算真实指数
                                         */
-                                        int msb = 1;  // M2 是 2 位, msb 在 bit[1] 或 bit[0]
-                                        while (msb >= 0 && !((m2 >> msb) & 1)) {
-                                            msb--;
-                                        }
-                                        int32_t true_exp = -14 - (1 - msb);
-                                        uint32_t norm_mant = (m2 << (22 - msb)) & 0x7FFFFF;
-
+                                        int shift = __builtin_ctz(m2);  // m2=01→shift=0, m2=10→shift=1, m2=11→shift=0
+                                        uint32_t norm_mantissa = m2 << shift;  // 把最高位移到 bit 1
+                                        // norm_mantissa 现在形式为 10 或 11 (即 1.x)
+                                        
+                                        int32_t true_exp = -16 + shift;  // -16 是基础指数
+                                        
+                                        // 构造 FP32: 尾数部分去掉隐含的1(bit1)，剩余位左移到位
+                                        uint32_t fp32_m = (norm_mantissa & 1) << 21;  // 剩余1位尾数放到 FP32 高位
+                                        
                                         f32_val = ((uint32_t)sign << 31)
                                                 | ((uint32_t)(true_exp + 127) << 23)
-                                                | norm_mant;
+                                                | fp32_m
+                                                | 0x40000000U;  // 隐含的1
                                     }
                                 } else if (e5 == 31) {  // 0b11111
                                     if (m2 == 0) {
@@ -554,31 +557,203 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
 
                                     f32_val = ((uint32_t)sign << 31)
                                             | (f32_exp << 23)
-                                            | f32_mant;
+                                            | f32_mant| 0x40000000U;
                                 }
 
                                 if (rd != 0) lane->fpr[rd] = f32_val;
                             }
                             break;
 
-                            case 3:{//down transfer,FP32 -> E5M2 write
-                                uint32_t f32_val = lane->fpr[rs1];
-                                //
+                            case 3: { /* fcvt.e5m2.s fd, fs1 — FP32 → E5M2 (下行写) */
+                            uint32_t fs1_val = lane->fpr[rs1];
+                            
+                            bool     sign  = (fs1_val >> 31) & 1;
+                            uint8_t  exp32 = (fs1_val >> 23) & 0xFF;
+                            uint32_t m23   = fs1_val & 0x7FFFFF;
+                            
+                            uint8_t e5m2_val;
 
+                            if (exp32 == 0 && m23 == 0) {
+                                /* ±Zero */
+                                e5m2_val = sign ? 0x80 : 0x00;
                                 
+                            } else if (exp32 == 255) {
+                                /* Inf / NaN → 保持为 E5M2 的 Inf/NaN */
+                                if (m23 == 0) {
+                                    /* Inf → E5M2 Inf (E=31, M=0) */
+                                    e5m2_val = (sign << 7) | 0x7C;  // 0_11111_00 = Inf
+                                } else {
+                                    /* NaN → E5M2 NaN (E=31, M≠0) */
+                                    e5m2_val = (sign << 7) | 0x7E;  // 0_11111_10 = NaN (Quiet)
+                                }
+                                
+                            } else {
+                                /* Normal or Subnormal FP32 */
+                                int32_t true_exp;
+                                uint32_t eff_mant;
+                                
+                                if (exp32 == 0) {
+                                    /* FP32 Subnormal → normalize */
+                                    int shift = __builtin_clz(m23) - 8;  // 32-23=9, clz范围9~31, 减8得shift
+                                    eff_mant = m23 << (shift + 1);
+                                    true_exp = -126 - shift;
+                                } else {
+                                    /* FP32 Normal */
+                                    eff_mant = (1U << 23) | m23;  // 加上隐含的1 → 24位有效数
+                                    true_exp = (int32_t)exp32 - 127;
+                                }
+                                
+                                /* 转换到 E5M2 指数域: bias 127 → 15 */
+                                int32_t e5m2_exp = true_exp + 15;
+                                
+                                if (e5m2_exp <= 0) {
+                                    /* 下溢到 E5M2 零或非正规 */
+                                    if (e5m2_exp <= -2) {  // 有效数全部移出
+                                        e5m2_val = sign ? 0x80 : 0x00;  // → ±0
+                                    } else {
+                                        /* E5M2 非正规: 右移 eff_mant 提取 2 位尾数 */
+                                        int shift_right = 1 - e5m2_exp;
+                                        if (shift_right >= 24) {
+                                            e5m2_val = sign ? 0x80 : 0x00;
+                                        } else {
+                                            uint32_t sub_m = (eff_mant >> (shift_right + 22)) & 0x3;
+                                            // 舍入处理...
+                                            e5m2_val = (sign << 7) | sub_m;  // E=0, M=sub_m
+                                        }
+                                    }
+                                    
+                                } else if (e5m2_exp >= 31) {
+                                    /* 上溢 → 饱和到 E5M2 Inf */
+                                    e5m2_val = (sign << 7) | 0x7C;  // 0_11111_00 = ±Inf
+                                    
+                                } else {
+                                    /* 在范围内: 24位尾数 → 2位尾数 + 舍入 */
+                                    uint32_t m2 = (eff_mant >> 21) & 0x3;  // 取高2位
+                                    
+                                    /* 舍入: guard(位20), round(位19), sticky(位18~0) */
+                                    uint32_t guard  = (eff_mant >> 20) & 1;
+                                    uint32_t round  = (eff_mant >> 19) & 1;
+                                    uint32_t sticky = ((eff_mant & 0x7FFFF) != 0) ? 1 : 0;
+                                    
+                                    /* RNE 舍入逻辑 (与你的 E4M3 代码一致) */
+                                    if (guard && (round || sticky)) {
+                                        m2++;  // 大于中间值 → 向上舍入
+                                    } else if (guard && !round && !sticky) {
+                                        if (m2 & 1) { m2++; }  // 中间值 → 向偶数舍入
+                                    }
+                                    /* RTZ (guard=0): 不操作 */
+
+                                    /* 处理进位: m2 从 3 溢出到 4 (即 2-bit 存不下) */
+                                    if (m2 >= 4) {
+                                        m2 = 0;
+                                        e5m2_exp++;
+                                        if (e5m2_exp >= 31) {
+                                            e5m2_val = (sign << 7) | 0x7C;  // 进位溢出 → Inf
+                                        } else {
+                                            e5m2_val = (sign << 7) | ((uint8_t)e5m2_exp << 2) | m2;
+                                        }
+                                    } else {
+                                        e5m2_val = (sign << 7) | ((uint8_t)e5m2_exp << 2) | m2;
+                                    }
+                                }
                             }
-                            break;                            
+                            
+                            if (rd != 0) lane->fpr[rd] = e5m2_val;
+                            }
+                            break;
                         }
                         update_fcsr(lane);
                         break;
                     case 0x26:
                         switch (rs2) {
-                            case 0:{
-
+                            case 0:{ /* fcvt.s.e2m1 fd, fs1 — E2M1 → FP32 */
+                                uint_8 e2m1_bits = lane->fpr[rs1] & 0xF;
+                                static const uint32_t e2m1_to_f32[16] = {
+                                    /* 正数 (S=0) */
+                                    [0x0] = 0x00000000U,              //  0.0f
+                                    [0x1] = 0x3F000000U,              //  0.5f  (0 01111110 000...)
+                                    [0x2] = 0x3F800000U,              //  1.0f  (0 01111111 000...)
+                                    [0x3] = 0x3FC00000U,              //  1.5f  (0 01111111 100...)
+                                    [0x4] = 0x40000000U,              //  2.0f  (0 10000000 000...)
+                                    [0x5] = 0x40400000U,              //  3.0f  (0 10000000 100...)
+                                    [0x6] = 0x40800000U,              //  4.0f  (0 10000001 000...)
+                                    [0x7] = 0x40C00000U,              //  6.0f  (0 10000001 100...)
+                                    
+                                    /* 负数 (S=1): 符号位置 1 */
+                                    [0x8] = 0x80000000U,              // -0.0f
+                                    [0x9] = 0xBF000000U,              // -0.5f
+                                    [0xA] = 0xBF800000U,              // -1.0f
+                                    [0xB] = 0xBFC00000U,              // -1.5f
+                                    [0xC] = 0xC0000000U,              // -2.0f
+                                    [0xD] = 0xC0400000U,              // -3.0f
+                                    [0xE] = 0xC0800000U,              // -4.0f
+                                    [0xF] = 0xC0C00000U,              // -6.0f
+                                };
+                                if (rd != 0) lane->fpr[rd] = e2m1_to_f32[e2m1_bits];
                             }
                             break;
-                            case 1:{
-
+                            case 1:{ /* fcvt.e2m1.s fd, fs1 — FP32 → E2M1 */
+                                uint32_t f32_val = lane->fpr[rs1];  // 例如 100.0f = 0x42C80000
+                                bool   sign  = (f32_val >> 31) & 1;         // 符号
+                                uint8_t exp32 = (f32_val >> 23) & 0xFF;     // 指数
+                                uint32_t m23   = f32_val & 0x7FFFFF;
+                                uint8_t result;
+                                if (exp32 == 0 && m23 == 0) {
+                                    result = sign ? 0x8 : 0x0;
+                                } else if (exp32 == 255) {
+                                    result = sign ? 0xF : 0x7;
+                                } else {
+                                    /*
+                                    * ★ 核心手写逻辑: 用 FP32 位模式比较来做量化
+                                    * 
+                                    * 方法: 将 abs_val 与各 E2M1 代表值的 FP32 阈值进行比较,
+                                    *       找到落在哪个区间, 然后按舍入模式选择
+                                    *
+                                    * 区间划分 (正半轴):
+                                    *   [0,     0.25)     → 0    (但 0 单独处理了)
+                                    *   [0.25,  0.75)     → 0.5  (中点在 0.5, 即 0.25~0.75 选 0.5)
+                                    *   [0.75,  1.25)     → 1.0
+                                    *   [1.25,  1.75)     → 1.5
+                                    *   [1.75,  2.5)      → 2.0
+                                    *   [2.5,   3.5)      → 3.0
+                                    *   [3.5,   5.0)      → 4.0
+                                    *   [5.0,   +∞)       → 6.0  (饱和!)
+                                    */
+                                    
+                                    // ★ 方法A: 逐级比较 (最直观, 易调试)
+                                    if (abs_val < 0x3EC00000U) {     // < 0.375 (近似 0.25~0.75 中点偏移)
+                                        // 接近 0 → 但由于 0 已单独处理, 这里给一个小正值
+                                        e2m1_result = (abs_val < 0x38800000U) ? 0x0 : 0x1;  // 0 or 0.5
+                                        // 更精确的做法需要考虑 RNE 舍入...
+                                    }
+                                    else if (abs_val < 0x3F000000U) {  // < 0.5
+                                        e2m1_result = 0x1;  // 0.5
+                                    }
+                                    else if (abs_val < 0x3F900000U) {  // ~1.2 (1.0 和 1.5 之间的判定点)
+                                        // 在 0.5 ~ 1.5 中点附近: 需要看具体舍入
+                                        e2m1_result = 0x2;  // 1.0 (默认 RTZ/RNE)
+                                    }
+                                    else if (abs_val < 0x40100000U) {  // ~2.25
+                                        e2m1_result = 0x3;  // 1.5
+                                    }
+                                    else if (abs_val < 0x40700000U) {  // ~3.75
+                                        e2m1_result = 0x4;  // 2.0
+                                    }
+                                    else if (abs_val < 0x40B00000U) {  // ~5.5
+                                        e2m1_result = 0x5;  // 3.0
+                                    }
+                                    else if (abs_val < 0x40D00000U) {  // ~7 (超过6的一半?)
+                                        e2m1_result = 0x6;  // 4.0
+                                    }
+                                    else {
+                                        // ★ 超过最大值范围 → 饱和到 6.0!
+                                        e2m1_result = 0x7;  // 6.0 (E2M1 max)
+                                    }
+                                    
+                                    /* 加回符号位 */
+                                    if (sign) e2m1_result |= 0x8;
+                                }
+                                if (rd != 0) lane->fpr[rd] = e2m1_result;
                             }
                             break;
                         }
