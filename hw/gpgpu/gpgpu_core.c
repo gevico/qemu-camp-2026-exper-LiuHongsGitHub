@@ -464,7 +464,7 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                                                 /* 如果 sub_mant == 0 且舍入后为零，保持符号位区分 ±0 */
                                             } 
                                         }
-                                        e4m3_val = sign ? 0x80 : 0x00;  // 简化：舍入到零
+                                        
                                     } else if (e4m3_exp >= 15) {
                                         /* 饱和 */
                                         e4m3_val = (sign << 7) | 0x7E;  // exp=F, mant=111
@@ -530,15 +530,14 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                                         uint32_t norm_mantissa = m2 << shift;  // 把最高位移到 bit 1
                                         // norm_mantissa 现在形式为 10 或 11 (即 1.x)
                                         
-                                        int32_t true_exp = -16 + shift;  // -16 是基础指数
+                                        int32_t true_exp = -14 - shift;   // -16 是基础指数
                                         
                                         // 构造 FP32: 尾数部分去掉隐含的1(bit1)，剩余位左移到位
-                                        uint32_t fp32_m = (norm_mantissa & 1) << 21;  // 剩余1位尾数放到 FP32 高位
+                                        uint32_t fp32_m = ((norm_mantissa >> 1) & 1) << 21;  // 剩余1位尾数放到 FP32 高位
                                         
                                         f32_val = ((uint32_t)sign << 31)
                                                 | ((uint32_t)(true_exp + 127) << 23)
-                                                | fp32_m
-                                                | 0x40000000U;  // 隐含的1
+                                                | fp32_m;  // 隐含的1
                                     }
                                 } else if (e5 == 31) {  // 0b11111
                                     if (m2 == 0) {
@@ -667,7 +666,7 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                     case 0x26:
                         switch (rs2) {
                             case 0:{ /* fcvt.s.e2m1 fd, fs1 — E2M1 → FP32 */
-                                uint_8 e2m1_bits = lane->fpr[rs1] & 0xF;
+                                uint8_t e2m1_bits = lane->fpr[rs1] & 0xF;
                                 static const uint32_t e2m1_to_f32[16] = {
                                     /* 正数 (S=0) */
                                     [0x0] = 0x00000000U,              //  0.0f
@@ -697,11 +696,12 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                                 bool   sign  = (f32_val >> 31) & 1;         // 符号
                                 uint8_t exp32 = (f32_val >> 23) & 0xFF;     // 指数
                                 uint32_t m23   = f32_val & 0x7FFFFF;
-                                uint8_t result;
+                                uint32_t abs_val = f32_val & 0x7FFFFFFFU;
+                                uint8_t e2m1_result;
                                 if (exp32 == 0 && m23 == 0) {
-                                    result = sign ? 0x8 : 0x0;
+                                    e2m1_result = sign ? 0x8 : 0x0;
                                 } else if (exp32 == 255) {
-                                    result = sign ? 0xF : 0x7;
+                                    e2m1_result = sign ? 0xF : 0x7;
                                 } else {
                                     /*
                                     * ★ 核心手写逻辑: 用 FP32 位模式比较来做量化
@@ -721,38 +721,37 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                                     */
                                     
                                     // ★ 方法A: 逐级比较 (最直观, 易调试)
-                                    if (abs_val < 0x3EC00000U) {     // < 0.375 (近似 0.25~0.75 中点偏移)
-                                        // 接近 0 → 但由于 0 已单独处理, 这里给一个小正值
-                                        e2m1_result = (abs_val < 0x38800000U) ? 0x0 : 0x1;  // 0 or 0.5
-                                        // 更精确的做法需要考虑 RNE 舍入...
+                                    if (abs_val < 0x3D800000U) {     
+                                        
+                                        e2m1_result = 0x0;  // 0 or 0.5
+                                    
                                     }
-                                    else if (abs_val < 0x3F000000U) {  // < 0.5
+                                    else if (abs_val < 0x3F400000U) {  // < 0.5
                                         e2m1_result = 0x1;  // 0.5
                                     }
-                                    else if (abs_val < 0x3F900000U) {  // ~1.2 (1.0 和 1.5 之间的判定点)
+                                    else if (abs_val < 0x3FA00000U) {  // ~1.2 (1.0 和 1.5 之间的判定点)
                                         // 在 0.5 ~ 1.5 中点附近: 需要看具体舍入
                                         e2m1_result = 0x2;  // 1.0 (默认 RTZ/RNE)
                                     }
-                                    else if (abs_val < 0x40100000U) {  // ~2.25
+                                    else if (abs_val < 0x3FE00000U) {  // ~2.25
                                         e2m1_result = 0x3;  // 1.5
                                     }
-                                    else if (abs_val < 0x40700000U) {  // ~3.75
+                                    else if (abs_val < 0x40200000U) {  // ~3.75
                                         e2m1_result = 0x4;  // 2.0
                                     }
-                                    else if (abs_val < 0x40B00000U) {  // ~5.5
+                                    else if (abs_val < 0x40600000U) {  // ~5.5
                                         e2m1_result = 0x5;  // 3.0
                                     }
-                                    else if (abs_val < 0x40D00000U) {  // ~7 (超过6的一半?)
+                                    else if (abs_val < 0x40A00000U) {  // ~7 (超过6的一半?)
                                         e2m1_result = 0x6;  // 4.0
                                     }
                                     else {
                                         // ★ 超过最大值范围 → 饱和到 6.0!
                                         e2m1_result = 0x7;  // 6.0 (E2M1 max)
                                     }
-                                    
-                                    /* 加回符号位 */
-                                    if (sign) e2m1_result |= 0x8;
                                 }
+                                /* 加回符号位 */
+                                if (sign) e2m1_result |= 0x8;
                                 if (rd != 0) lane->fpr[rd] = e2m1_result;
                             }
                             break;
@@ -783,7 +782,9 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                                 if (float32_lt_quiet(fs1,fs2,&lane->fp_status)){
                                     if (rd !=0) lane->gpr[rd] = 1;
                                 }else {
-                                    if (rd !=0) lane->gpr[rd] = 0;
+                                    if (rd !=0) lane->gpr[rd] =
+                                    
+                                    0;
                                 }   
                                 break;
                             case 2:
