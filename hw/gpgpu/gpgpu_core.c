@@ -134,37 +134,49 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
             {
                 uint32_t addr = lane->gpr[rs1] + imm_i;
                 uint32_t val = 0;
-                switch (funct3) {
-                case 0: /* LB */
-                    uint8_t b = address_space_ldub(pci_device_iommu_address_space(PCI_DEVICE(s)),
-                                                    addr, MEMTXATTRS_UNSPECIFIED, NULL);
-                    val = sext32(b, 8);
-                    break;       
-                case 1: /* LH */
-                    {
-                    uint16_t h = address_space_lduw_le(pci_device_iommu_address_space(PCI_DEVICE(s)),
-                                                    addr, MEMTXATTRS_UNSPECIFIED, NULL);
-                    val = sext32(h, 16); 
+                if (addr < s->vram_size){
+                    switch (funct3) {
+                    case 0: val = sext32(s->vram_ptr[addr], 8); break;          // LB
+                    case 1: { uint16_t h; memcpy(&h, s->vram_ptr+addr, 2); val = sext32(h, 16); } break;  // LH
+                    case 2: memcpy(&val, s->vram_ptr+addr, 4); break;           // LW
+                    case 4: val = s->vram_ptr[addr]; break;                      // LBU
+                    case 5: { uint16_t h; memcpy(&h, s->vram_ptr+addr, 2); val = h; } break;             // LHU
+                    default: return;
                     }
-                    break;     
-                case 2: /* LW */
-                    val = address_space_ldl_le(pci_device_iommu_address_space(PCI_DEVICE(s)),
-                                                    addr, MEMTXATTRS_UNSPECIFIED, NULL);
-                    break;                                       
-                case 4: /* LBU */
-                    val = address_space_lduw_le(pci_device_iommu_address_space(PCI_DEVICE(s)),
-                                                    addr, MEMTXATTRS_UNSPECIFIED, NULL);
-                    break;                    
-                case 5: /* LHU */
-                    {
-                    uint16_t h = address_space_lduw_le(pci_device_iommu_address_space(PCI_DEVICE(s)),
-                                                    addr, MEMTXATTRS_UNSPECIFIED, NULL);
-                    val = (uint32_t)h;
+                } else {
+                    switch (funct3) {
+                    case 0: /* LB */
+                        uint8_t b = address_space_ldub(pci_device_iommu_address_space(PCI_DEVICE(s)),
+                                                        addr, MEMTXATTRS_UNSPECIFIED, NULL);
+                        val = sext32(b, 8);
+                        break;       
+                    case 1: /* LH */
+                        {
+                        uint16_t h = address_space_lduw_le(pci_device_iommu_address_space(PCI_DEVICE(s)),
+                                                        addr, MEMTXATTRS_UNSPECIFIED, NULL);
+                        val = sext32(h, 16); 
+                        }
+                        break;     
+                    case 2: /* LW */
+                        val = address_space_ldl_le(pci_device_iommu_address_space(PCI_DEVICE(s)),
+                                                        addr, MEMTXATTRS_UNSPECIFIED, NULL);
+                        break;                                       
+                    case 4: /* LBU */
+                        val = address_space_lduw_le(pci_device_iommu_address_space(PCI_DEVICE(s)),
+                                                        addr, MEMTXATTRS_UNSPECIFIED, NULL);
+                        break;                    
+                    case 5: /* LHU */
+                        {
+                        uint16_t h = address_space_lduw_le(pci_device_iommu_address_space(PCI_DEVICE(s)),
+                                                        addr, MEMTXATTRS_UNSPECIFIED, NULL);
+                        val = (uint32_t)h;
+                        }
+                        
+                        break;                 
+                    default: return;
                     }
-                    
-                    break;                 
-                default: return;
                 }
+                
                 if (rd != 0) lane->gpr[rd] = val;
             }
             return;
@@ -172,21 +184,29 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
         /* STORE: SB, SH, SW */
         case 0x23:
             {   
-                if (funct3 == 0){
-                    uint32_t addr = lane->gpr[rs1] + imm_s;
+                uint32_t addr = lane->gpr[rs1] + imm_s;
+                if (addr < s->vram_size){
+                    if (funct3 == 0)      s->vram_ptr[addr] = lane->gpr[rs2] & 0xFF;
+                    else if (funct3 == 1) memcpy(s->vram_ptr+addr, &lane->gpr[rs2], 2);
+                    else if (funct3 == 2) memcpy(s->vram_ptr+addr, &lane->gpr[rs2], 4);
+                } else {
+                    if (funct3 == 0){
+                  
                     uint32_t val = lane->gpr[rs2] & 0xFF;
                     address_space_stb(pci_device_iommu_address_space(PCI_DEVICE(s)),
                                         addr, val, MEMTXATTRS_UNSPECIFIED, NULL);
                 } else if (funct3 == 1){
-                    uint32_t addr = lane->gpr[rs1] + imm_s;
+                    
                     uint32_t val = lane->gpr[rs2] & 0xFFFF;
                     address_space_stw_le(pci_device_iommu_address_space(PCI_DEVICE(s)),
                                         addr, val, MEMTXATTRS_UNSPECIFIED, NULL);
                 } else if (funct3 == 2){
-                    uint32_t addr = lane->gpr[rs1] + imm_s;
+                    
                     address_space_stl_le(pci_device_iommu_address_space(PCI_DEVICE(s)),
                                         addr, lane->gpr[rs2], MEMTXATTRS_UNSPECIFIED, NULL);
                 }
+                }
+                
             }
             return;
 
@@ -270,22 +290,42 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
             return;
         case 0x07:
             {
-                if (funct3 == 2 && rd != 0){
-                    uint32_t addr = lane->gpr[rs1] +imm_i;
-                    uint32_t val = address_space_ldl_le(pci_device_iommu_address_space(PCI_DEVICE(s)),
-                                                        addr, MEMTXATTRS_UNSPECIFIED, NULL);
-                    lane->fpr[rd] = val;
+                uint32_t addr = lane->gpr[rs1] + imm_s;
+                if (addr < s->vram_size){
+                    if (funct3 == 2 && rd != 0){
+                        
+                        uint32_t val = s->vram_ptr[addr] = lane->gpr[rs2] & 0xFF;
+                        lane->fpr[rd] = val;
+                    }
+                } else {
+                    if (funct3 == 2 && rd != 0){
+                        
+                        uint32_t val = address_space_ldl_le(pci_device_iommu_address_space(PCI_DEVICE(s)),
+                                                            addr, MEMTXATTRS_UNSPECIFIED, NULL);
+                        lane->fpr[rd] = val;
+                    }
                 }
+                
                 return;
             }
         //funct3 = 0x2   
         case 0x27:
             {
-                if (funct3 ==2 && rs2 != 0){
-                    uint32_t addr = lane->gpr[rs1] + imm_s;
+                uint32_t addr = lane->gpr[rs1] + imm_s;
+                if (addr < s->vram_size){
+                    if (funct3 ==2 && rs2 != 0){
+                    
+                        uint32_t val = s->vram_ptr[addr] = lane->gpr[rs2] & 0xFF;
+                            lane->fpr[rd] = val;
+                    }
+                }else {
+                    if (funct3 ==2 && rs2 != 0){
+                   
                     address_space_stl_le(pci_device_iommu_address_space(PCI_DEVICE(s)),
                                         addr, lane->fpr[rs2], MEMTXATTRS_UNSPECIFIED, NULL);
+                    }
                 }
+                
             }
             return;
         case 0x43:
