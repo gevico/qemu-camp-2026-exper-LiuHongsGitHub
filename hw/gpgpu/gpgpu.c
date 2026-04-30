@@ -22,11 +22,29 @@
 #include "gpgpu.h"
 #include "gpgpu_core.h"
 
+static void gpgpu_reset(DeviceState *dev)
+{
+    GPGPUState *s = GPGPU(dev);
+
+    s->global_ctrl = 0;
+    s->global_status = GPGPU_STATUS_READY;
+    s->error_status = 0;
+    s->irq_enable = 0;
+    s->irq_status = 0;
+    memset(&s->kernel, 0, sizeof(s->kernel));
+    memset(&s->dma, 0, sizeof(s->dma));
+    memset(&s->simt, 0, sizeof(s->simt));
+    timer_del(s->dma_timer);
+    timer_del(s->kernel_timer);
+    if (s->vram_ptr) {
+        memset(s->vram_ptr, 0, s->vram_size);
+    }
+}
+
 /* TODO: Implement MMIO control register read */
 static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned size)
 {
     GPGPUState *s = GPGPU(opaque);
-    uint32_t val = 0;
     switch (addr)
     {
     case GPGPU_REG_DEV_ID:
@@ -123,7 +141,7 @@ static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned size)
 
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
-                      "GPGPU: read to unimplemented register 0x%x\n",
+                      "GPGPU: read to unimplemented register 0x%lx\n",
                       addr);
         return 0;
     }
@@ -229,7 +247,7 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
             s->simt.thread_mask = v;
             break;
         default:
-            qemu_log_mask(LOG_GUEST_ERROR,"GPGPU: write to unimplemented register 0x%x\n", addr);
+            qemu_log_mask(LOG_GUEST_ERROR,"GPGPU: write to unimplemented register 0x%lx\n", addr);
             break;
     }
 
@@ -314,10 +332,9 @@ static const MemoryRegionOps gpgpu_doorbell_ops = {
 static void gpgpu_dma_complete(void *opaque)
 {
     GPGPUState *s = GPGPU(opaque);
-    bool dir_to_vram = s->dma.ctrl & GPGPU_DMA_DIR_TO_VRAM;
-    uint64_t src_addr = s->dma.src_addr;
-    uint64_t dst_addr = s->dma.dst_addr;
-    uint64_t size = s->dma.size;
+   
+
+
     
     s->dma.status &= ~GPGPU_DMA_BUSY;
     s->dma.status |= GPGPU_DMA_COMPLETE;
@@ -326,7 +343,7 @@ static void gpgpu_dma_complete(void *opaque)
     if (s->dma.ctrl & GPGPU_DMA_IRQ_ENABLE){
         s->irq_status |= GPGPU_IRQ_DMA_DONE;
         if (s->irq_enable & GPGPU_IRQ_DMA_DONE) {
-            msix_notify(PCIDevice(s),GPGPU_MSIX_VEC_DMA);
+            msix_notify(PCI_DEVICE(s),GPGPU_MSIX_VEC_DMA);
         }
     }
 }
@@ -339,7 +356,7 @@ static void gpgpu_kernel_complete(void *opaque)
     s->global_status |= GPGPU_STATUS_READY;
     s->irq_status |= GPGPU_IRQ_KERNEL_DONE;
     if (s->irq_enable & GPGPU_IRQ_KERNEL_DONE) {
-        msix_notify(PCIDevice(s),GPGPU_MSIX_VEC_KERNEL);
+        msix_notify(PCI_DEVICE(s),GPGPU_MSIX_VEC_KERNEL);
     }
 }
 
@@ -408,24 +425,7 @@ static void gpgpu_exit(PCIDevice *pdev)
     msi_uninit(pdev);
 }
 
-static void gpgpu_reset(DeviceState *dev)
-{
-    GPGPUState *s = GPGPU(dev);
 
-    s->global_ctrl = 0;
-    s->global_status = GPGPU_STATUS_READY;
-    s->error_status = 0;
-    s->irq_enable = 0;
-    s->irq_status = 0;
-    memset(&s->kernel, 0, sizeof(s->kernel));
-    memset(&s->dma, 0, sizeof(s->dma));
-    memset(&s->simt, 0, sizeof(s->simt));
-    timer_del(s->dma_timer);
-    timer_del(s->kernel_timer);
-    if (s->vram_ptr) {
-        memset(s->vram_ptr, 0, s->vram_size);
-    }
-}
 
 static const Property gpgpu_properties[] = {
     DEFINE_PROP_UINT32("num_cus", GPGPUState, num_cus,

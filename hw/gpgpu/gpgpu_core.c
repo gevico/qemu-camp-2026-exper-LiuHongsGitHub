@@ -367,15 +367,19 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                         break;
                     case 0x22:
                         switch (rs2) {
-                            case 0:
+                            case 0:{
                                 uint16_t bf16_val = lane->fpr[rs1] & 0xFFFF;
                                 uint32_t f32_val = ((uint32_t)bf16_val) << 16;
                                 lane->fpr[rd] = f32_val;
+                                }
+                                
                                 break;
-                            case 1:
-                                uint32_t f32_val = lane->fpr[rs1];
-                                uint16_t bf16_val = (f32_val >> 16) & 0xFFFF;
-                                lane->fpr[rd] = bf16_val;
+                            case 1:{
+                                    uint32_t f32_val = lane->fpr[rs1];
+                                    uint16_t bf16_val = (f32_val >> 16) & 0xFFFF;
+                                    lane->fpr[rd] = bf16_val;
+                                }
+                                
                                 break;
                             default:
                                 break;
