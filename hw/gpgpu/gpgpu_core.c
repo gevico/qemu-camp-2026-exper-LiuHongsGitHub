@@ -162,7 +162,7 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                                                         addr, MEMTXATTRS_UNSPECIFIED, NULL);
                         break;                                       
                     case 4: /* LBU */
-                        val = address_space_lduw_le(pci_device_iommu_address_space(PCI_DEVICE(s)),
+                        val = address_space_ldub(pci_device_iommu_address_space(PCI_DEVICE(s)),
                                                         addr, MEMTXATTRS_UNSPECIFIED, NULL);
                         break;                    
                     case 5: /* LHU */
@@ -265,12 +265,12 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
 
         /* ECALL/EBREAK */
         case 0x73:
-            uint32_t csr_imm = (inst >> 20) & 0x1F;
+            uint32_t csr_num = (inst >> 20) & 0xFFF;   // CSR register number (12 bits)
             if (funct3 == 0 && rd ==0 && rs1 == 0){
                 lane->gpr[17] =1;
             } else if (funct3 == 2 || funct3 == 3 ||funct3 == 6 ||funct3 == 7) {
                 uint32_t csr_val = 0;
-                switch (csr_imm) {
+                switch (csr_num) {
                     case CSR_MHARTID:
                         csr_val = lane->mhartid;
                         break;
@@ -290,11 +290,12 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
             return;
         case 0x07:
             {
-                uint32_t addr = lane->gpr[rs1] + imm_s;
+                uint32_t addr = lane->gpr[rs1] + imm_i;
                 if (addr < s->vram_size){
                     if (funct3 == 2 && rd != 0){
+                        uint32_t val;
+                        memcpy(&val, s->vram_ptr+addr, 4);
                         
-                        uint32_t val = s->vram_ptr[addr] = lane->gpr[rs2] & 0xFF;
                         lane->fpr[rd] = val;
                     }
                 } else {
@@ -313,13 +314,11 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
             {
                 uint32_t addr = lane->gpr[rs1] + imm_s;
                 if (addr < s->vram_size){
-                    if (funct3 ==2 && rs2 != 0){
-                    
-                        uint32_t val = s->vram_ptr[addr] = lane->gpr[rs2] & 0xFF;
-                            lane->fpr[rd] = val;
+                    if (funct3 ==2 ){
+                        memcpy(s->vram_ptr+addr,&lane->fpr[rs2],4);                       
                     }
                 }else {
-                    if (funct3 ==2 && rs2 != 0){
+                    if (funct3 ==2 ){
                    
                     address_space_stl_le(pci_device_iommu_address_space(PCI_DEVICE(s)),
                                         addr, lane->fpr[rs2], MEMTXATTRS_UNSPECIFIED, NULL);
@@ -849,11 +848,12 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                         }
                         break;
                     case 0x60: 
-                        if (funct3 == 0) {
-                            lane->gpr[rd] = float32_to_int32(fs1,&lane->fp_status);
-                        } else if (funct3 == 1) {
-                            lane->fpr[rd] = (uint32_t)float32_to_uint32(fs1,&lane->fp_status);
-                        }
+                        lane->gpr[rd] = float32_to_int32(fs1,&lane->fp_status);
+                        // if (funct3 == 0) {
+                            
+                        // } else if (funct3 == 1) {
+                        //     lane->fpr[rd] = (uint32_t)float32_to_uint32(fs1,&lane->fp_status);
+                        // }
                         break;
                     case 0x68: 
                         if (funct3 == 0){
@@ -898,6 +898,8 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                             lane->fpr[rd] = lane->gpr[rs1];
                         }
                         break;
+                    
+                    
                     
                 }
                 update_fcsr(lane);
