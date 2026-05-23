@@ -35,10 +35,10 @@ static void gpgpu_reset(DeviceState *dev)
     memset(&s->dma, 0, sizeof(s->dma));
     memset(&s->simt, 0, sizeof(s->simt));
     timer_del(s->dma_timer);
-    timer_del(s->kernel_timer);
     if (s->vram_ptr) {
         memset(s->vram_ptr, 0, s->vram_size);
     }
+    pci_set_irq(PCI_DEVICE(s), 0);
 }
 
 /* TODO: Implement MMIO control register read */
@@ -154,10 +154,24 @@ static void gpgpu_dispatch_kernel(GPGPUState *s) {
     }
     s->global_status |= GPGPU_STATUS_BUSY;
     gpgpu_core_exec_kernel(s);
+    printf("[POST-KERNEL] vram_ptr at 0x80000:");
+    for (int i = 0; i < 8; i++) {
+        uint32_t val;
+        memcpy(&val, s->vram_ptr + 0x80000 + i*4, 4);
+        printf(" %08x", val);
+    }
+    printf("\n");
     s->global_status &= ~GPGPU_STATUS_BUSY;
     s->global_status |= GPGPU_STATUS_READY;
     s->irq_status |= GPGPU_IRQ_KERNEL_DONE;
-
+    if (s->irq_enable & GPGPU_IRQ_KERNEL_DONE) {
+        if (msix_enabled(PCI_DEVICE(s))) {
+            msix_notify(PCI_DEVICE(s), GPGPU_MSIX_VEC_KERNEL);
+        } else {
+            pci_set_irq(PCI_DEVICE(s), 1);
+        }
+    }
+    
 }
 
 /* TODO: Implement MMIO control register write */
@@ -183,6 +197,9 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
             break;
         case GPGPU_REG_IRQ_ACK:
             s->irq_status &= ~v;
+            if (s->irq_status == 0) {
+                pci_set_irq(PCI_DEVICE(s), 0);
+            }
             break;
         /* 内核分发 */
         case GPGPU_REG_KERNEL_ADDR_LO:
@@ -229,6 +246,13 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
             s->dma.ctrl = v;
             if (v&GPGPU_DMA_START) {
                 s->dma.status = GPGPU_DMA_BUSY;
+                AddressSpace *as = pci_device_iommu_address_space(PCI_DEVICE(s));
+                if (s->dma.size > 0 && s->dma.size <= 16*1024*1024){
+                    uint8_t *buf = g_malloc(s->dma.size);
+                    address_space_read(as, s->dma.src_addr,MEMTXATTRS_UNSPECIFIED, buf, s->dma.size);
+                    address_space_write(as, s->dma.dst_addr,MEMTXATTRS_UNSPECIFIED, buf, s->dma.size);
+                    g_free(buf);
+                } 
                 timer_mod(s->dma_timer,qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
             }
             break;
@@ -275,7 +299,11 @@ static uint64_t gpgpu_vram_read(void *opaque, hwaddr addr, unsigned size)
     if (addr +size<=s->vram_size){
         memcpy(&result,s->vram_ptr+addr,size);
     }
-    
+    // ★ 只追踪 C 数组区域 (hC=0x80000, size=1024)
+    if (addr >= 0x80000 && addr < 0x80400) {
+        printf("[VRAM_READ] addr=0x%lx size=%u result=0x%lx\n",
+               (unsigned long)addr, size, (unsigned long)result);
+    }
     return result;
 }
 
@@ -333,32 +361,22 @@ static void gpgpu_dma_complete(void *opaque)
 {
     GPGPUState *s = GPGPU(opaque);
    
-
-
-    
     s->dma.status &= ~GPGPU_DMA_BUSY;
     s->dma.status |= GPGPU_DMA_COMPLETE;
     s->dma.ctrl &= ~GPGPU_DMA_START;
-    // notify host
-    if (s->dma.ctrl & GPGPU_DMA_IRQ_ENABLE){
-        s->irq_status |= GPGPU_IRQ_DMA_DONE;
-        if (s->irq_enable & GPGPU_IRQ_DMA_DONE) {
-            msix_notify(PCI_DEVICE(s),GPGPU_MSIX_VEC_DMA);
+    s->irq_status |= GPGPU_IRQ_DMA_DONE;
+    
+    /* 触发中断：优先 MSI-X，否则用 INTx */
+     if (s->irq_enable & GPGPU_IRQ_DMA_DONE) {
+        if (msix_enabled(PCI_DEVICE(s))) {
+            msix_notify(PCI_DEVICE(s), GPGPU_MSIX_VEC_DMA);
+        } else {
+            pci_set_irq(PCI_DEVICE(s), 1);
         }
     }
 }
 
 /* TODO: Implement kernel completion handler */
-static void gpgpu_kernel_complete(void *opaque)
-{
-    GPGPUState *s = GPGPU(opaque);
-    s->global_status &= ~GPGPU_STATUS_BUSY;
-    s->global_status |= GPGPU_STATUS_READY;
-    s->irq_status |= GPGPU_IRQ_KERNEL_DONE;
-    if (s->irq_enable & GPGPU_IRQ_KERNEL_DONE) {
-        msix_notify(PCI_DEVICE(s),GPGPU_MSIX_VEC_KERNEL);
-    }
-}
 
 static void gpgpu_realize(PCIDevice *pdev, Error **errp)
 {
@@ -398,18 +416,16 @@ static void gpgpu_realize(PCIDevice *pdev, Error **errp)
                      &s->doorbell_mmio);
 
     if (msix_init(pdev, GPGPU_MSIX_VECTORS,
-                  &s->ctrl_mmio, 0, 0xFE000,
-                  &s->ctrl_mmio, 0, 0xFF000,
+                  &s->ctrl_mmio, 0,0xFE000,
+                  &s->ctrl_mmio, 0,0xFF000,
                   0, errp)) {
         g_free(s->vram_ptr);
         return;
     }
 
-    msi_init(pdev, 0, 1, true, false, errp);
+    // msi_init(pdev, 0, 1, true, false, errp);
 
     s->dma_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, gpgpu_dma_complete, s);
-    s->kernel_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
-                                   gpgpu_kernel_complete, s);
 
     s->global_status = GPGPU_STATUS_READY;
 }
@@ -419,7 +435,6 @@ static void gpgpu_exit(PCIDevice *pdev)
     GPGPUState *s = GPGPU(pdev);
 
     timer_free(s->dma_timer);
-    timer_free(s->kernel_timer);
     g_free(s->vram_ptr);
     msix_uninit(pdev, &s->ctrl_mmio, &s->ctrl_mmio);
     msi_uninit(pdev);

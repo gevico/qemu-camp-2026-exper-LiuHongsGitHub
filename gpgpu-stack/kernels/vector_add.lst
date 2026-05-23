@@ -1,0 +1,25 @@
+GAS LISTING vector_add.S 			page 1
+
+
+   1              	.section .text
+   2              	.global vector_add_kernel
+   3              	vector_add_kernel:
+   4              	    /* 1. 从 args 加载 A, B, C 的基地址 */
+   5 0000 83220500 	    lw t0, 0(a0)
+   6 0004 03234500 	    lw t1, 4(a0)
+   7 0008 83238500 	    lw t2, 8(a0)
+   8              	    /* 2. 计算偏移量: offset = thread_id * 4 (float = 4 bytes) */
+   9 000c 139E2500 	    slli t3, a1, 2
+  10              	    /* 3. 计算数组元素的地址 */
+  11 0010 B382C201 	    add t0, t0, t3
+  12 0014 3303C301 	    add t1, t1, t3
+  13 0018 B383C301 	    add t2, t2, t3
+  14              	    /* 4. 加载数据并执行加法 */
+  15 001c 07A00200 	    flw f0, 0(t0)
+  16 0020 87200300 	    flw f1, 0(t1)
+  17 0024 53711000 	    fadd.s f2, f0, f1
+  18 0028 27A02300 	    fsw f2, 0(t2)
+  19              	  
+  20              	    /* 5. 退出: 设置 a7 = 1，然后 ecall */
+  21 002c 93081000 	    li a7, 1
+  22 0030 73000000 	    ecall

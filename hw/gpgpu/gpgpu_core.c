@@ -16,7 +16,7 @@
 // #include "exec/cpu_ldst.h"
 
 /* TODO: Implement warp initialization */
-void gpgpu_core_init_warp(GPGPUWarp *warp, uint32_t pc,
+void gpgpu_core_init_warp(GPGPUWarp *warp, uint32_t pc, uint64_t  kernel_args,
                           uint32_t thread_id_base, const uint32_t block_id[3],
                           uint32_t num_threads,
                           uint32_t warp_id, uint32_t block_id_linear)
@@ -24,7 +24,7 @@ void gpgpu_core_init_warp(GPGPUWarp *warp, uint32_t pc,
     //清零 warp结构
     memset(warp, 0, sizeof(*warp));
     //init warp meta data
-    warp->active_mask = num_threads == 32 ? 0xFFFFFFFF : (1<< num_threads)-1;
+    warp->active_mask = num_threads >= 32 ? 0xFFFFFFFF : (1U<< num_threads)-1;
     warp->thread_id_base = thread_id_base;
     warp->warp_id = warp_id;
     memcpy(warp->block_id, block_id, sizeof(warp->block_id ));
@@ -35,7 +35,8 @@ void gpgpu_core_init_warp(GPGPUWarp *warp, uint32_t pc,
         lane->fcsr = 0;
         lane->active = i < num_threads ;
         if (lane -> active) {
-            lane->gpr[1] = thread_id_base + i;
+            lane->gpr[11] = thread_id_base + i;
+            lane->gpr[10] = (uint32_t)kernel_args;
         }
         set_default_nan_mode(1,&lane->fp_status);
     }
@@ -291,15 +292,18 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
         case 0x07:
             {
                 uint32_t addr = lane->gpr[rs1] + imm_i;
+                printf("  [FLW] f%d = mem[0x%x]\n", rd, addr);
                 if (addr < s->vram_size){
-                    if (funct3 == 2 && rd != 0){
+                    if (funct3 == 2){
                         uint32_t val;
                         memcpy(&val, s->vram_ptr+addr, 4);
                         
                         lane->fpr[rd] = val;
+                        printf("  [DEBUG] FLW: mem[0x%x] = 0x%08x (%f)\n",
+                               addr, val, *(float*)&val);
                     }
                 } else {
-                    if (funct3 == 2 && rd != 0){
+                    if (funct3 == 2){
                         
                         uint32_t val = address_space_ldl_le(pci_device_iommu_address_space(PCI_DEVICE(s)),
                                                             addr, MEMTXATTRS_UNSPECIFIED, NULL);
@@ -334,7 +338,7 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                 float32 fs3_fmadd = make_float32(lane->fpr[rs3]);
             
                 float32 result_fmadd = float32_muladd(fs1_fmadd,fs2_fmadd,fs3_fmadd,0,&lane->fp_status);
-                if (rd != 0) lane->fpr[rd] = (uint32_t)result_fmadd;
+                lane->fpr[rd] = (uint32_t)result_fmadd;
             }
             return;
         case 0x47:
@@ -343,7 +347,7 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                 float32 fs2_fmsub = make_float32(lane->fpr[rs2]);
                 float32 fs3_fmsub = make_float32(lane->fpr[rs3]);
                 float32 result_fmsub = float32_muladd(fs1_fmsub,fs2_fmsub,fs3_fmsub,float_muladd_negate_c,&lane->fp_status);
-                if (rd != 0) lane->fpr[rd] = (uint32_t)result_fmsub;
+                lane->fpr[rd] = (uint32_t)result_fmsub;
             }
             return;
         case 0x4B:
@@ -352,7 +356,7 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                 float32 fs2_fnmsub  = make_float32(lane->fpr[rs2]);
                 float32 fs3_fnmsub  = make_float32(lane->fpr[rs3]);
                 float32 result_fnmsub = float32_muladd(fs1_fnmsub,fs2_fnmsub,fs3_fnmsub,float_muladd_negate_product,&lane->fp_status);
-                if (rd != 0) lane->fpr[rd] = (uint32_t)result_fnmsub;
+                lane->fpr[rd] = (uint32_t)result_fnmsub;
             }
             return;
         case 0x4F:/* FNMADD.S - Fused NegMultiply-Add: rd = -(fs1 * fs2) - fs3 */
@@ -361,7 +365,7 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                 float32 fs2_fnmadd = make_float32(lane->fpr[rs2]);
                 float32 fs3_fnmadd = make_float32(lane->fpr[rs3]);
                 float32 result_fnmadd = float32_muladd(fs1_fnmadd,fs2_fnmadd,fs3_fnmadd,float_muladd_negate_product | float_muladd_negate_c,&lane->fp_status);
-                if (rd != 0) lane->fpr[rd] = (uint32_t)result_fnmadd;
+                lane->fpr[rd] = (uint32_t)result_fnmadd;
             }
             return;
         case 0x53:
@@ -372,27 +376,20 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                 float32 result = make_float32(0);
                 switch (funct7) {
                     case 0x00: 
-                        if (funct3 == 0) {
-                            result = float32_add(fs1,fs2,&lane->fp_status);
-                            if (rd != 0) lane->fpr[rd] = (uint32_t)result;
-                        } else if (funct3 == 1) {
-                            result = float32_sub(fs1,fs2,&lane->fp_status);
-                            if (rd != 0) lane->fpr[rd] = (uint32_t)result;
-                        }
+                        result = float32_add(fs1,fs2,&lane->fp_status);
+                        lane->fpr[rd] = (uint32_t)result;
+                        break;
+                    case 0x04:
+                        result = float32_sub(fs1,fs2,&lane->fp_status);
+                        lane->fpr[rd] = (uint32_t)result;
                         break;
                     case 0x08: 
-                        if (funct3 == 0) {
-                            result = float32_mul(fs1,fs2,&lane->fp_status);
-                            if (rd != 0) lane->fpr[rd] = (uint32_t)result;
-                        }
+                        result = float32_mul(fs1,fs2,&lane->fp_status);
+                        lane->fpr[rd] = (uint32_t)result;
                         break;
-                    case 0x18://FDIV.S
-                        if (funct3 == 0) {
-                            result = float32_div(fs1,fs2,&lane->fp_status);
-                            if (rd != 0) {
-                                lane->fpr[rd] = (uint32_t)result;
-                            }
-                        }
+                    case 0x0C://FDIV.S
+                        result = float32_div(fs1,fs2,&lane->fp_status);
+                        lane->fpr[rd] = (uint32_t)result;
                         break;
                     case 0x20: 
                         if (funct3 == 0) {
@@ -402,7 +399,7 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                         } else if (funct3 == 2) {
                             result = make_float32(float32_val(fs1) ^ (float32_val(fs2)&0x80000000));
                         }
-                        if (rd != 0) lane->fpr[rd] = (uint32_t)result;
+                        lane->fpr[rd] = (uint32_t)result;
                         break;
                     case 0x22:
                         switch (rs2) {
@@ -460,7 +457,7 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                                     uint32_t mantissa = (mantissa3 << 20) & 0x7FFFFF; // 将 M 部分左移到 FP32 的位置
                                     f32_val = ((uint32_t)sign << 31) | (exp << 23) | mantissa | 0x40000000;  // 加隐含的 1
                                 }
-                                if (rd != 0) lane->fpr[rd] = f32_val;
+                                lane->fpr[rd] = f32_val;
                             }
                             break;
                             case 1:{//fcvt.e4m3.s fd,fs1 - FP32 → E4M3 (下行写)
@@ -545,7 +542,7 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                                         }
                                     }
                                 }
-                                if (rd != 0) lane->fpr[rd] = e4m3_val;
+                                lane->fpr[rd] = e4m3_val;
                                 
                             }
                             break;
@@ -602,7 +599,7 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                                             | f32_mant| 0x40000000U;
                                 }
 
-                                if (rd != 0) lane->fpr[rd] = f32_val;
+                                lane->fpr[rd] = f32_val;
                             }
                             break;
 
@@ -700,7 +697,7 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                                 }
                             }
                             
-                            if (rd != 0) lane->fpr[rd] = e5m2_val;
+                            lane->fpr[rd] = e5m2_val;
                             }
                             break;
                         }
@@ -731,7 +728,7 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                                     [0xE] = 0xC0800000U,              // -4.0f
                                     [0xF] = 0xC0C00000U,              // -6.0f
                                 };
-                                if (rd != 0) lane->fpr[rd] = e2m1_to_f32[e2m1_bits];
+                                lane->fpr[rd] = e2m1_to_f32[e2m1_bits];
                             }
                             break;
                             case 1:{ /* fcvt.e2m1.s fd, fs1 — FP32 → E2M1 */
@@ -795,23 +792,21 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                                 }
                                 /* 加回符号位 */
                                 if (sign) e2m1_result |= 0x8;
-                                if (rd != 0) lane->fpr[rd] = e2m1_result;
+                                lane->fpr[rd] = e2m1_result;
                             }
                             break;
                         }
                         break;
-                    case 0x28: 
+                    case 0x14: 
                         if (funct3 == 0) {
                             result = float32_min(fs1,fs2,&lane->fp_status);
-                            if (rd != 0) lane->fpr[rd] = (uint32_t)result;
-                        }
-                        break;
-                    case 0x29:
-                        if (funct3 == 0) {
+                        } else if (funct3 == 1) {
                             result = float32_max(fs1,fs2,&lane->fp_status);
-                            if (rd != 0) lane->fpr[rd] = (uint32_t)result;
                         }
+                        
+                        lane->fpr[rd] = (uint32_t)result;
                         break;
+                    
                     case 0x50:
                         switch (funct3){
                             case 0:
@@ -841,25 +836,25 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                                 break;
                         }
                         break;
-                    case 0x58:
-                        if (funct3 == 0) {
-                            result = float32_sqrt(fs1,&lane->fp_status);
-                            if (rd != 0) lane->fpr[rd] = (uint32_t)result;
-                        }
+                    case 0x2C:
+                        result = float32_sqrt(fs1,&lane->fp_status);
+                        lane->fpr[rd] = (uint32_t)result;
                         break;
                     case 0x60: 
-                        lane->gpr[rd] = float32_to_int32(fs1,&lane->fp_status);
-                        // if (funct3 == 0) {
-                            
-                        // } else if (funct3 == 1) {
-                        //     lane->fpr[rd] = (uint32_t)float32_to_uint32(fs1,&lane->fp_status);
-                        // }
+                        if (rs2 == 0) {
+                            if (rd != 0) lane->gpr[rd] = float32_to_int32(fs1, &lane->fp_status);
+                        } else if (rs2 == 1) {
+                            if (rd != 0) lane->gpr[rd] = (int32_t)float32_to_uint32(fs1, &lane->fp_status);
+                        }
                         break;
                     case 0x68: 
-                        if (funct3 == 0){
+                        if (rs2 == 0) {
                             result = int32_to_float32((int32_t)lane->gpr[rs1],&lane->fp_status);
-                            lane->fpr[rd] = (uint32_t)result;
+                        } else if (rs2 == 1){
+                            result = uint32_to_float32(lane->gpr[rs1], &lane->fp_status);
                         }
+                        
+                        lane->fpr[rd] = (uint32_t)result;
                         break;
                     case 0x70: 
                         if (funct3 == 1){// FCLASS.S → 返回10位掩码到整数寄存器
@@ -883,16 +878,11 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
                                 lane->gpr[rd] = fclass;
                             }
                         }
-                        if (funct3 == 0){
+                        if (funct3 == 0 && rd != 0){
                             lane->gpr[rd] = lane->fpr[rs1];
                         }
                         break;
-                    case 0x69:
-                        if (funct3 == 0){
-                            result = uint32_to_float32(lane->gpr[rs1], &lane->fp_status);
-                            if (rd != 0) lane->fpr[rd] = (uint32_t)result;
-                        }
-                        break;
+                
                     case 0x78: 
                         if (funct3 == 0){
                             lane->fpr[rd] = lane->gpr[rs1];
@@ -953,6 +943,7 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
 {
     for(uint32_t cycles = 0; cycles < max_cycles; cycles++){
         if (warp->active_mask == 0){
+            printf("[WARP] All lanes finished\n");
             return 0;
         }
         for(int i =0 ; i< GPGPU_WARP_SIZE;i++){
@@ -973,10 +964,21 @@ int gpgpu_core_exec_warp(GPGPUState *s, GPGPUWarp *warp, uint32_t max_cycles)
                     pci_device_iommu_address_space(PCI_DEVICE(s)),
                     lane->pc, MEMTXATTRS_UNSPECIFIED, NULL);
             }
+            uint32_t pc_before = lane->pc;
+            printf("[EXEC] mhartid=0x%05x PC=0x%08x INST=0x%08x opcode=%02x\n",
+                   lane->mhartid, pc_before, inst, inst & 0x7F);
             lane->pc += 4;
             //general reg a7 == 1 mean syscall exit
             decode_and_exec(s,lane,inst);
+            printf("  After: PC=0x%08x a0=%08x t0=%08x t1=%08x t2=%08x f0=%08x f1=%08x f2=%08x a7=%u\n",
+                lane->pc, 
+                lane->gpr[10], lane->gpr[5], lane->gpr[6], lane->gpr[7],
+                lane->fpr[0], lane->fpr[1], lane->fpr[2],
+                lane->gpr[17]);
+
+
             if (lane->gpr[17] == 1){
+                printf("[LANE %d] Finished (a7=1)\n", i);
                 lane->active = false;
                 warp->active_mask &= ~(1U<<i);
             }
@@ -1015,9 +1017,9 @@ int gpgpu_core_exec_kernel(GPGPUState *s)
                 for (uint32_t w = 0; w < warps_per_block; w++) {
                     uint32_t tid_base = block_linear * threads_per_block 
                                        + w * 32;
-                    gpgpu_core_init_warp(&warps[w], kernel_addr, 
+                    gpgpu_core_init_warp(&warps[w], kernel_addr, s->kernel.kernel_args,
                                          tid_base, block_id,
-                                         threads_per_block - w * 32,
+                                         MIN(32,threads_per_block - w * 32),
                                          w, block_linear);
                 }
                 
