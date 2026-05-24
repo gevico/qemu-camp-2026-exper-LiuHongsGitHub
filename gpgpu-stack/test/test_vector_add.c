@@ -17,7 +17,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
-#include "../include/gpgpu.h"
+#include "../runtime/include/gpgpu.h"
 
 /* 简单的 RV32I kernel 代码 (二进制形式) */
 /* 这个 kernel 执行: C[thread_id] = A[thread_id] + B[thread_id] */

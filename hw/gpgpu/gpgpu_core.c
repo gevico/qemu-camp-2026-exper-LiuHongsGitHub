@@ -39,6 +39,7 @@ void gpgpu_core_init_warp(GPGPUWarp *warp, uint32_t pc, uint64_t  kernel_args,
             lane->gpr[10] = (uint32_t)kernel_args;
         }
         set_default_nan_mode(1,&lane->fp_status);
+        set_float_default_nan_pattern(0b01000000, &lane->fp_status);
     }
    
 }
@@ -333,6 +334,8 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
             return;
         case 0x43:
             {
+                uint8_t rm = (funct3 == 7) ? get_rm(lane) : funct3;
+                lane->fp_status.float_rounding_mode = rv_rm_to_soft(rm);
                 float32 fs1_fmadd = make_float32(lane->fpr[rs1]);  // 声明局部变量
                 float32 fs2_fmadd = make_float32(lane->fpr[rs2]);
                 float32 fs3_fmadd = make_float32(lane->fpr[rs3]);
@@ -343,6 +346,8 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
             return;
         case 0x47:
             {
+                uint8_t rm = (funct3 == 7) ? get_rm(lane) : funct3;
+                lane->fp_status.float_rounding_mode = rv_rm_to_soft(rm);
                 float32 fs1_fmsub = make_float32(lane->fpr[rs1]);
                 float32 fs2_fmsub = make_float32(lane->fpr[rs2]);
                 float32 fs3_fmsub = make_float32(lane->fpr[rs3]);
@@ -352,6 +357,8 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
             return;
         case 0x4B:
             {
+                uint8_t rm = (funct3 == 7) ? get_rm(lane) : funct3;
+                lane->fp_status.float_rounding_mode = rv_rm_to_soft(rm);
                 float32 fs1_fnmsub  = make_float32(lane->fpr[rs1]);
                 float32 fs2_fnmsub  = make_float32(lane->fpr[rs2]);
                 float32 fs3_fnmsub  = make_float32(lane->fpr[rs3]);
@@ -361,6 +368,8 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
             return;
         case 0x4F:/* FNMADD.S - Fused NegMultiply-Add: rd = -(fs1 * fs2) - fs3 */
             {
+                uint8_t rm = (funct3 == 7) ? get_rm(lane) : funct3;
+                lane->fp_status.float_rounding_mode = rv_rm_to_soft(rm);
                 float32 fs1_fnmadd = make_float32(lane->fpr[rs1]);
                 float32 fs2_fnmadd = make_float32(lane->fpr[rs2]);
                 float32 fs3_fnmadd = make_float32(lane->fpr[rs3]);
@@ -370,7 +379,10 @@ static inline void decode_and_exec(GPGPUState *s,GPGPULane *lane, uint32_t inst)
             return;
         case 0x53:
             {
-                lane->fp_status.float_rounding_mode = rv_rm_to_soft(get_rm(lane));
+                {
+                    uint8_t rm = (funct3 == 7) ? get_rm(lane) : funct3;
+                    lane->fp_status.float_rounding_mode = rv_rm_to_soft(rm);
+                }
                 float32 fs1 = make_float32(lane->fpr[rs1]);
                 float32 fs2 = make_float32(lane->fpr[rs2]);
                 float32 result = make_float32(0);
