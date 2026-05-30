@@ -38,7 +38,9 @@ static void gpgpu_reset(DeviceState *dev)
     if (s->vram_ptr) {
         memset(s->vram_ptr, 0, s->vram_size);
     }
-    pci_set_irq(PCI_DEVICE(s), 0);
+    if (!msix_enabled(PCI_DEVICE(s)) && !msi_enabled(PCI_DEVICE(s))) {
+        pci_set_irq(PCI_DEVICE(s), 0);
+    }
 }
 
 /* TODO: Implement MMIO control register read */
@@ -167,6 +169,8 @@ static void gpgpu_dispatch_kernel(GPGPUState *s) {
     if (s->irq_enable & GPGPU_IRQ_KERNEL_DONE) {
         if (msix_enabled(PCI_DEVICE(s))) {
             msix_notify(PCI_DEVICE(s), GPGPU_MSIX_VEC_KERNEL);
+        } if (msi_enabled(PCI_DEVICE(s))) {
+            msi_notify(PCI_DEVICE(s),0);
         } else {
             pci_set_irq(PCI_DEVICE(s), 1);
         }
@@ -197,7 +201,7 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
             break;
         case GPGPU_REG_IRQ_ACK:
             s->irq_status &= ~v;
-            if (s->irq_status == 0) {
+            if (s->irq_status == 0 && !msix_enabled(PCI_DEVICE(s)) && !msi_enabled(PCI_DEVICE(s))) {
                 pci_set_irq(PCI_DEVICE(s), 0);
             }
             break;
@@ -248,12 +252,43 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
                 s->dma.status = GPGPU_DMA_BUSY;
                 AddressSpace *as = pci_device_iommu_address_space(PCI_DEVICE(s));
                 if (s->dma.size > 0 && s->dma.size <= 16*1024*1024){
+
                     uint8_t *buf = g_malloc(s->dma.size);
-                    address_space_read(as, s->dma.src_addr,MEMTXATTRS_UNSPECIFIED, buf, s->dma.size);
-                    address_space_write(as, s->dma.dst_addr,MEMTXATTRS_UNSPECIFIED, buf, s->dma.size);
+                    if (s->dma.ctrl & GPGPU_DMA_DIR_FROM_VRAM){
+                        if (s->dma.src_addr +s->dma.size> s->vram_size) {
+                            s->dma.status = GPGPU_DMA_ERROR;
+                            s->error_status |= GPGPU_ERR_VRAM_FAULT;
+                            g_free(buf);
+                            break;
+                        }
+                        memcpy(buf, s->vram_ptr+s->dma.src_addr, s->dma.size);
+                        address_space_write(as, s->dma.dst_addr,MEMTXATTRS_UNSPECIFIED, buf, s->dma.size);
+                    } else {
+                        if (s->dma.dst_addr+s->dma.size > s->vram_size) {
+                            s->dma.status = GPGPU_DMA_ERROR;
+                            s->error_status |= GPGPU_ERR_VRAM_FAULT;
+                            g_free(buf);
+                            break;
+                        }
+                        address_space_read(as, s->dma.src_addr,MEMTXATTRS_UNSPECIFIED, buf, s->dma.size);
+                        memcpy(s->vram_ptr+s->dma.dst_addr, buf, s->dma.size);
+                    }
+                     
                     g_free(buf);
+                    s->dma.status = GPGPU_DMA_COMPLETE;
+                    s->dma.ctrl &= ~GPGPU_DMA_START;
+                    s->irq_status |= GPGPU_IRQ_DMA_DONE;
+                    if (s->irq_enable & GPGPU_IRQ_DMA_DONE) {
+                        if (msix_enabled(PCI_DEVICE(s))) {
+                            msix_notify(PCI_DEVICE(s), GPGPU_MSIX_VEC_DMA);
+                        } else if (msi_enabled(PCI_DEVICE(s))) {
+                            msi_notify(PCI_DEVICE(s),0);
+                        } else {
+                            pci_set_irq(PCI_DEVICE(s), 1);
+                        }
+                    }
                 } 
-                timer_mod(s->dma_timer,qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
+                
             }
             break;
         case GPGPU_REG_THREAD_ID_X: s->simt.thread_id[0] = v; break;
@@ -366,10 +401,12 @@ static void gpgpu_dma_complete(void *opaque)
     s->dma.ctrl &= ~GPGPU_DMA_START;
     s->irq_status |= GPGPU_IRQ_DMA_DONE;
     
-    /* 触发中断：优先 MSI-X，否则用 INTx */
+    
      if (s->irq_enable & GPGPU_IRQ_DMA_DONE) {
         if (msix_enabled(PCI_DEVICE(s))) {
             msix_notify(PCI_DEVICE(s), GPGPU_MSIX_VEC_DMA);
+        } if (msi_enabled(PCI_DEVICE(s))) {
+            msi_notify(PCI_DEVICE(s), 0);
         } else {
             pci_set_irq(PCI_DEVICE(s), 1);
         }
@@ -423,7 +460,7 @@ static void gpgpu_realize(PCIDevice *pdev, Error **errp)
         return;
     }
 
-    // msi_init(pdev, 0, 1, true, false, errp);
+    msi_init(pdev, 0, 1, true, false, errp);
 
     s->dma_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, gpgpu_dma_complete, s);
 
